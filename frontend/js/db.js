@@ -142,6 +142,10 @@ function _deriveState(row) {
   // appears later).  Render it as a gray informational badge, not a red
   // failure.
   if (row.error_stage === "no_video") return "novideo";
+  // "no_content" is the same kind of soft, retryable stage for a lecture
+  // whose recording exists but yielded no transcript / has no audio track.
+  // Show it as the gray "No Content" badge rather than a red failure.
+  if (row.error_stage === "no_content") return "skipped";
   if (row.error_stage) return "failed";
   if (row.summary && row.processed_at) return "ready";
   // Processed, no summary, no error = a lecture the backend permanently

@@ -86,24 +86,40 @@ def merge(local_path: str, remote_path: str):
             # 3) Lectures: merge existing rows (progress forward only)
             #    - Progress fields: COALESCE(local, remote) — prefer non-null
             #    - Error fields: clear if processed, otherwise keep the most info
+            #
+            #    Exception: a local soft ``no_content`` error deliberately
+            #    clears ``processed_at`` so the lecture is retried.  Without
+            #    this case, COALESCE would resurrect remote's old processed_at
+            #    and the merge would both hide the retry and reset its error
+            #    counter, making the lecture retry forever.
             conn.execute("""
                 UPDATE main.lectures SET
                     transcript    = COALESCE(l.transcript,    main.lectures.transcript),
                     summary       = COALESCE(l.summary,       main.lectures.summary),
                     summary_model = COALESCE(l.summary_model, main.lectures.summary_model),
-                    processed_at  = COALESCE(l.processed_at,  main.lectures.processed_at),
+                    processed_at  = CASE
+                        WHEN l.error_stage = 'no_content' AND l.processed_at IS NULL
+                        THEN NULL
+                        ELSE COALESCE(l.processed_at,  main.lectures.processed_at)
+                    END,
                     emailed_at    = COALESCE(l.emailed_at,    main.lectures.emailed_at),
                     error_msg = CASE
+                        WHEN l.error_stage = 'no_content'
+                        THEN COALESCE(l.error_msg, main.lectures.error_msg)
                         WHEN COALESCE(l.processed_at, main.lectures.processed_at) IS NOT NULL
                         THEN NULL
                         ELSE COALESCE(l.error_msg, main.lectures.error_msg)
                     END,
                     error_count = CASE
+                        WHEN l.error_stage = 'no_content'
+                        THEN MAX(COALESCE(l.error_count, 0), COALESCE(main.lectures.error_count, 0))
                         WHEN COALESCE(l.processed_at, main.lectures.processed_at) IS NOT NULL
                         THEN 0
                         ELSE MAX(COALESCE(l.error_count, 0), COALESCE(main.lectures.error_count, 0))
                     END,
                     error_stage = CASE
+                        WHEN l.error_stage = 'no_content'
+                        THEN 'no_content'
                         WHEN COALESCE(l.processed_at, main.lectures.processed_at) IS NOT NULL
                         THEN NULL
                         ELSE COALESCE(l.error_stage, main.lectures.error_stage)

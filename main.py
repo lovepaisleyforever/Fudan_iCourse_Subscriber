@@ -113,10 +113,16 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
             lectures = deduped
 
             known_processed = db.get_processed_sub_ids(course_id)
+            # A lecture with playback but no summary would otherwise be
+            # re-queued on every single run; exclude ones that already hit
+            # the error cap so a permanently-broken lecture is abandoned
+            # (summarize-stage failures are exempt — see get_exhausted_sub_ids).
+            exhausted = db.get_exhausted_sub_ids(course_id)
             new_lectures = [
                 lec for lec in lectures
                 if lec.get("has_playback")
                 and str(lec["sub_id"]) not in known_processed
+                and str(lec["sub_id"]) not in exhausted
             ]
             unprocessed = db.get_unprocessed_lectures(course_id)
             new_ids = {str(lec["sub_id"]) for lec in new_lectures}
@@ -304,6 +310,11 @@ def run():
     corrected = db.sync_dates_from_sub()
     if corrected:
         print(f"  [Date] Synced {corrected} lecture date(s) from sub_title", flush=True)
+    requeued, summarize_reset = db.requeue_stuck_lectures()
+    if requeued:
+        print(f"  [Repair] Re-queued {requeued} empty lecture(s) for retry", flush=True)
+    if summarize_reset:
+        print(f"  [Repair] Reset {summarize_reset} summarize-failure counter(s)", flush=True)
     transcriber = Transcriber()
     summarizer = Summarizer() if config.COURSE_IDS else None
     emailer = Emailer() if (

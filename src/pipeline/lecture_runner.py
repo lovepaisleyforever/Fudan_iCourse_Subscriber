@@ -146,10 +146,15 @@ class LectureRunner:
 
         # ── Phase F — bucketed-prompt LLM summary ──────────────────────
         if not transcript.strip():
-            self._reporter.info("    Empty transcript, skipping summary.")
+            # Empty transcript — a transient ASR / audio-decode hiccup, or a
+            # genuinely silent recording.  Do NOT mark_processed here: that
+            # freezes the lecture as a permanent grey "No Content" even if
+            # the recording later becomes usable.  Record a soft "no_content"
+            # error instead so it is retried; the per-lecture error cap stops
+            # retrying after a few runs if it really is empty.
+            self._reporter.info("    Empty transcript, will retry next run.")
             self._release_audio(sub_id)
-            self._db.mark_processed(sub_id)
-            self._db.clear_error(sub_id)
+            self._db.update_error(sub_id, "no_content", "empty transcript")
             return None
 
         summary = self._summarize(
@@ -322,8 +327,12 @@ class LectureRunner:
                 handle.path, handle.process, handle.stderr_chunks,
             )
         except NoAudioStreamError as e:
+            # The recording exists but carries no audio track — nothing to
+            # transcribe, ever.  Mark it processed so it isn't retried, and
+            # record it as a soft "no_content" (grey) rather than a red
+            # "transcribe" failure.
             self._reporter.info(f"    [SKIP] Video-only (no audio stream): {e}")
-            self._db.update_error(sub_id, "transcribe", str(e))
+            self._db.update_error(sub_id, "no_content", str(e))
             self._db.mark_processed(sub_id)
             self._release_audio(sub_id)
             return None, None

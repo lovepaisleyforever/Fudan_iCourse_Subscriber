@@ -200,11 +200,17 @@ class Database:
         a permanently-failing lecture (e.g. ``get-sub-info`` RuntimeError
         for a removed recording) is abandoned after that many attempts
         rather than clogging every workflow run.
+
+        ``summarize`` errors are exempt from the cap: they are almost always
+        a *global* LLM-provider outage or a model rename, not a property of
+        the lecture, so abandoning the lecture after 3 runs would silently
+        lose the summary even after the provider recovers.
         """
         query = (
             "SELECT * FROM lectures"
             " WHERE processed_at IS NULL"
-            "   AND (error_count IS NULL OR error_count < ?)"
+            "   AND (error_count IS NULL OR error_count < ?"
+            "        OR error_stage = 'summarize')"
         )
         params: tuple = (max_errors,)
         if course_id:
@@ -213,6 +219,66 @@ class Database:
         with self._lock:
             rows = self.conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+    def get_exhausted_sub_ids(self, course_id: str | None = None,
+                              max_errors: int = 3) -> set[str]:
+        """Return sub_ids that have permanently failed (error cap reached).
+
+        Used to keep ``_enumerate_lectures`` from re-queueing a lecture that
+        has playback but keeps failing, which would otherwise retry forever
+        because the "has playback + not processed" path ignores error_count.
+        ``summarize`` errors are excluded so those keep getting retried.
+        """
+        query = (
+            "SELECT sub_id FROM lectures"
+            " WHERE error_count IS NOT NULL AND error_count >= ?"
+            "   AND (error_stage IS NULL OR error_stage != 'summarize')"
+        )
+        params: tuple = (max_errors,)
+        if course_id:
+            query += " AND course_id = ?"
+            params = (max_errors, course_id)
+        with self._lock:
+            rows = self.conn.execute(query, params).fetchall()
+        return {row["sub_id"] for row in rows}
+
+    def requeue_stuck_lectures(self) -> tuple[int, int]:
+        """One-time repair for lectures the old code marked processed with
+        no content.
+
+        Before the ``no_video`` stage existed, a lecture whose recording was
+        not published yet (or whose transcript came back empty) was marked
+        ``processed_at`` with empty transcript + summary, so it showed as a
+        permanent grey "No Content" and was never retried — even after the
+        recording appeared. Reset ``processed_at`` for those rows so they get
+        picked up again.
+
+        Summarize-failure counters are also reset: a model rename / provider
+        outage is global, so pre-fix failures shouldn't count toward the
+        per-lecture abandonment cap.
+
+        This runs on every invocation (the deploy-time merge is
+        additive-only, so a meta flag wouldn't survive to the next run
+        anyway).  It is idempotent and cheap: a row it re-queues either gets
+        real content on the retry (and stops matching the WHERE clause) or
+        stays empty and is abandoned by the error cap.
+
+        Returns ``(requeued, summarize_reset)``.
+        """
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE lectures SET processed_at = NULL
+                   WHERE processed_at IS NOT NULL
+                     AND (transcript IS NULL OR transcript = '')
+                     AND (summary IS NULL OR summary = '')"""
+            )
+            requeued = cur.rowcount or 0
+            cur = self.conn.execute(
+                """UPDATE lectures SET error_count = 0
+                   WHERE error_stage = 'summarize'"""
+            )
+            summarize_reset = cur.rowcount or 0
+        return requeued, summarize_reset
 
     def update_transcript(self, sub_id: str, transcript: str):
         with self._lock, self.conn:
