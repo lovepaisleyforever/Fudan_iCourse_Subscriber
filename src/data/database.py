@@ -257,6 +257,11 @@ class Database:
         outage is global, so pre-fix failures shouldn't count toward the
         per-lecture abandonment cap.
 
+        It also re-queues ``no_content`` lectures that already have OCR'd
+        slides: those can now be summarized from the slides alone (muted-mic
+        recordings), so they deserve another attempt even if they hit the
+        error cap.
+
         This runs on every invocation (the deploy-time merge is
         additive-only, so a meta flag wouldn't survive to the next run
         anyway).  It is idempotent and cheap: a row it re-queues either gets
@@ -266,6 +271,7 @@ class Database:
         Returns ``(requeued, summarize_reset)``.
         """
         with self._lock, self.conn:
+            # (a) processed but empty (transcript + summary both blank)
             cur = self.conn.execute(
                 """UPDATE lectures SET processed_at = NULL
                    WHERE processed_at IS NOT NULL
@@ -273,6 +279,20 @@ class Database:
                      AND (summary IS NULL OR summary = '')"""
             )
             requeued = cur.rowcount or 0
+            # (b) silent recordings that already have OCR'd slides: the
+            #     pipeline can now summarize the slides alone, so re-queue
+            #     them even though they previously hit the error cap.
+            cur = self.conn.execute(
+                """UPDATE lectures SET error_count = 0, processed_at = NULL
+                   WHERE error_stage = 'no_content'
+                     AND sub_id IN (
+                         SELECT DISTINCT sub_id FROM ppt_pages
+                         WHERE ocr_status = 'done'
+                           AND text IS NOT NULL AND text != ''
+                     )"""
+            )
+            requeued += cur.rowcount or 0
+            # (c) summarize failures are global (provider outage / rename)
             cur = self.conn.execute(
                 """UPDATE lectures SET error_count = 0
                    WHERE error_stage = 'summarize'"""

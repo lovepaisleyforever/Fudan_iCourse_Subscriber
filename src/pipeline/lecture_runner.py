@@ -145,20 +145,32 @@ class LectureRunner:
             self._ppt.prefetch_and_ocr(self._client, next_course, next_sub)
 
         # ── Phase F — bucketed-prompt LLM summary ──────────────────────
-        if not transcript.strip():
-            # Empty transcript — a transient ASR / audio-decode hiccup, or a
-            # genuinely silent recording.  Do NOT mark_processed here: that
-            # freezes the lecture as a permanent grey "No Content" even if
-            # the recording later becomes usable.  Record a soft "no_content"
-            # error instead so it is retried; the per-lecture error cap stops
-            # retrying after a few runs if it really is empty.
-            self._reporter.info("    Empty transcript, will retry next run.")
-            self._release_audio(sub_id)
-            self._db.update_error(sub_id, "no_content", "empty transcript")
-            return None
+        ppt_only = not transcript.strip()
+        if ppt_only:
+            # The recording carries no speech.  This is common for lectures
+            # the teacher recorded with a muted mic — iCourse's own ASR
+            # returns 10002 "未查询到语音数据" for them too.  We can't invent
+            # a transcript, but if the screenshots were OCR'd we can still
+            # produce a review note from the slides instead of leaving a
+            # permanent grey "No Content".  Only when there are no slides
+            # either do we fall back to a retryable soft error.
+            kept = self._db.get_done_ppt_pages(sub_id)
+            if not kept:
+                self._reporter.info(
+                    "    No speech and no OCR'd slides — will retry next run."
+                )
+                self._release_audio(sub_id)
+                self._db.update_error(sub_id, "no_content",
+                                      "empty transcript, no ppt")
+                return None
+            self._reporter.info(
+                f"    No speech in recording; summarizing {len(kept)} "
+                f"slide(s) only."
+            )
 
         summary = self._summarize(
             sub_id, course_title, transcript, transcript_segments,
+            ppt_only=ppt_only,
         )
         if summary is None:
             self._release_audio(sub_id)
@@ -359,20 +371,45 @@ class LectureRunner:
         return transcript, segments
 
     def _summarize(self, sub_id: str, course_title: str, transcript: str,
-                   transcript_segments: list[dict] | None) -> Optional[str]:
+                   transcript_segments: list[dict] | None,
+                   ppt_only: bool = False) -> Optional[str]:
         try:
             kept_pages = self._db.get_done_ppt_pages(sub_id)
             prompt_text, mode = bucketer.assemble(
                 transcript, transcript_segments, kept_pages,
             )
+            if ppt_only and not prompt_text.strip():
+                # All slides were dedup noise / empty — nothing to summarize.
+                self._reporter.info(
+                    "    PPT-only fallback found no usable slide text."
+                )
+                self._db.update_error(sub_id, "no_content",
+                                      "empty transcript, empty ppt")
+                return None
+            if ppt_only:
+                # Tell the model explicitly that there is no audio, so it
+                # summarizes the slides without padding/hallucinating.
+                prompt_text = (
+                    "【说明】本节课堂录音没有可用语音（麦克风疑似未录音），"
+                    "因此没有音频转录；下面只有 PPT 画面的文字识别结果。"
+                    "请仅依据这些 PPT 内容整理用于复习的笔记，不要编造讲解内容，"
+                    "信息不足时就如实简短。\n\n" + prompt_text
+                )
             self._reporter.info(
                 f"    [Time] Generating summary at "
                 f"{time.strftime('%H:%M:%S')}"
-                f" — mode={mode}, prompt={len(prompt_text)} chars"
+                f" — mode={mode}, ppt_only={ppt_only}, "
+                f"prompt={len(prompt_text)} chars"
             )
             summary, model_used = self._summarizer.summarize(
                 course_title, prompt_text,
             )
+            if ppt_only:
+                summary = (
+                    "> ⚠️ 本节录音无有效语音（麦克风疑似未录音，iCourse 官方"
+                    "转写同样为空），以下笔记仅依据 PPT 画面识别整理，"
+                    "不含课堂讲解内容。\n\n" + summary
+                )
             self._reporter.info(
                 f"    [OK] Summary by {model_used}: {len(summary)} chars"
             )
