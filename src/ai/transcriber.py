@@ -357,6 +357,7 @@ class Transcriber:
         timeout: int,
         wait_on_empty_sec: float = 0.0,
         label: str = "stream",
+        idle_timeout: float = 0.0,
     ) -> tuple[str, list[dict]]:
         """Pull PCM f32le mono 16 kHz bytes through a callable, feed VAD/ASR,
         return ``(transcript, segments)``.
@@ -372,6 +373,9 @@ class Transcriber:
             timeout: total seconds before we give up and raise TimeoutError.
             wait_on_empty_sec: poll interval for the tail-f wait branch; set
                 0 for pipe sources (where empty read truly means EOF).
+            idle_timeout: abort when no bytes arrived for this many seconds
+                (0 disables).  Only meaningful for tail-f sources — a pipe
+                reports EOF instead of going idle.
         """
         self._init()
         self._reset_vad()
@@ -383,6 +387,7 @@ class Transcriber:
         total_read = 0      # samples
         total_bytes = 0
         last_report = t0
+        last_data_at = t0   # last time read_fn returned bytes
         last_segment_at = 0.0
         silence_marked = False
 
@@ -392,15 +397,39 @@ class Transcriber:
                 raise TimeoutError(
                     f"Transcription timed out after {timeout}s"
                 )
+            # Second line of defence behind ffmpeg's -rw_timeout: if the
+            # producer (ffmpeg) has stopped delivering bytes entirely, fail
+            # instead of spinning silently for the whole `timeout`.
+            if idle_timeout > 0 and now - last_data_at > idle_timeout:
+                raise TimeoutError(
+                    f"No audio data for {now - last_data_at:.0f}s "
+                    f"(idle timeout {idle_timeout:.0f}s) — the upstream "
+                    f"download has stalled"
+                )
 
             raw = read_fn(BYTES_PER_SECOND)
             if not raw:
                 if is_eof_fn():
                     break
+                # Heartbeat while waiting for the producer: without this the
+                # log goes completely silent during a slow/stalled download,
+                # which is indistinguishable from a hung job in the Actions
+                # UI.
+                if now - last_report >= 60:
+                    print(
+                        f"[Transcriber] Waiting for audio: "
+                        f"{now - last_data_at:.0f}s since last byte, "
+                        f"{now - t0:.0f}s elapsed, "
+                        f"{total_bytes / 1024 / 1024:.1f} MB received"
+                        f"{_resource_meter('io')}",
+                        flush=True,
+                    )
+                    last_report = now
                 if wait_on_empty_sec > 0:
                     time.sleep(wait_on_empty_sec)
                 continue
 
+            last_data_at = now
             total_bytes += len(raw)
             samples = np.frombuffer(raw, dtype=np.float32)
             total_read += len(samples)
@@ -571,6 +600,7 @@ class Transcriber:
                         ffmpeg_proc: subprocess.Popen,
                         stderr_chunks: list[bytes],
                         timeout: int = 7200,
+                        idle_timeout: float = 900.0,
                         ) -> tuple[str, list[dict]]:
         """Read PCM samples from a disk file that ffmpeg is *concurrently* writing.
 
@@ -580,6 +610,10 @@ class Transcriber:
                 know when "no more data ever".  Owned by the caller (Scheduler).
             stderr_chunks: List that the caller's stderr-drain thread appends to.
             timeout: Total seconds before giving up.
+            idle_timeout: Give up after this many seconds without a single
+                new byte from ffmpeg.  15 min is far beyond any normal CDN
+                hiccup that ``-reconnect`` could not recover from, and stops
+                a stalled download from burning the whole ``timeout``.
 
         Returns:
             ``(transcript, segments)``.
@@ -624,6 +658,7 @@ class Transcriber:
                 return_code_fn=lambda: ffmpeg_proc.returncode,
                 timeout=timeout,
                 wait_on_empty_sec=0.1,
+                idle_timeout=idle_timeout,
                 label="tail",
             )
             # ffmpeg can exit 0 on a server-side truncated stream; without
@@ -650,6 +685,9 @@ class Transcriber:
         if http_headers:
             cmd += ["-headers", http_headers]
         cmd += [
+            # See AudioDownloader: without a read timeout a stalled socket
+            # blocks ffmpeg in read() indefinitely.
+            "-rw_timeout", "30000000",
             "-reconnect", "1",
             "-reconnect_streamed", "1",
             "-reconnect_delay_max", "5",

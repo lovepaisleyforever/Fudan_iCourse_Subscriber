@@ -218,6 +218,16 @@ class AudioDownloader:
                 cmd = [
                     "ffmpeg", "-y",
                     "-headers", headers,
+                    # Abort a stalled read instead of parking in read()
+                    # forever.  Without it a half-open TCP connection to the
+                    # video origin (common: US runner → WebVPN → CN CDN)
+                    # leaves ffmpeg never writing audio and never exiting,
+                    # so the transcriber's tail-f loop spins silently and the
+                    # job looks frozen until the overall timeout fires.
+                    # 30 s of no bytes makes ffmpeg drop the connection and
+                    # let -reconnect take over; if reconnect keeps failing it
+                    # exits and the lecture becomes a retryable error.
+                    "-rw_timeout", "30000000",
                     "-reconnect", "1",
                     "-reconnect_streamed", "1",
                     "-reconnect_delay_max", "5",
